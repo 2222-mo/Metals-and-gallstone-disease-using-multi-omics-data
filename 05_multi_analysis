@@ -1,0 +1,168 @@
+library(data.table)
+library(glmnet)
+library(ggplot2)
+
+set.seed(20261123)
+dir.create("results", showWarnings = FALSE)
+
+data <- fread("data/simulated_multiomics_data.csv")
+species_vars <- grep("^sp_", names(data), value = TRUE)
+metabolite_vars <- grep("^met_", names(data), value = TRUE)
+
+for (variable in metabolite_vars) {
+  values <- data[[variable]]
+  values[is.na(values)] <- median(values, na.rm = TRUE)
+  set(data, j = variable, value = values)
+}
+
+clr_row <- function(x) {
+  positive <- x[x > 0]
+  pseudocount <- if (length(positive)) min(positive) / 2 else 1e-10
+  adjusted <- x + pseudocount
+  log(adjusted) - mean(log(adjusted))
+}
+
+species_matrix <- t(apply(as.matrix(data[, ..species_vars]), 1, clr_row))
+colnames(species_matrix) <- species_vars
+metabolite_matrix <- scale(as.matrix(data[, ..metabolite_vars]))
+colnames(metabolite_matrix) <- metabolite_vars
+
+prepare_features <- function(metal, type) {
+  if (type == "microbiome") {
+    result <- fread("results/microbiome_species_metals_CLR_results.csv")
+    selected <- result[Metal == metal][order(P_FDR)][P_FDR < 0.10, Species]
+    if (length(selected) < 2) selected <- result[Metal == metal][order(P_value)][1:10, Species]
+    return(unique(selected[selected %in% colnames(species_matrix)]))
+  }
+  result <- fread("results/metabolite_metals_results.csv")
+  selected <- result[Metal == metal][order(P_FDR)][P_FDR < 0.10, Metabolite]
+  if (length(selected) < 2) selected <- result[Metal == metal][order(P_value)][1:10, Metabolite]
+  unique(selected[selected %in% colnames(metabolite_matrix)])
+}
+
+fit_signature <- function(metal, type) {
+  selected <- prepare_features(metal, type)
+  x <- if (type == "microbiome") species_matrix[, selected, drop = FALSE] else metabolite_matrix[, selected, drop = FALSE]
+  y <- data[[paste0("ln_", metal)]]
+  fit <- cv.glmnet(x, y, family = "gaussian", alpha = 1, nfolds = 10)
+  coefficients <- as.matrix(coef(fit, s = "lambda.min"))
+  retained <- rownames(coefficients)[coefficients[, 1] != 0]
+  retained <- setdiff(retained, "(Intercept)")
+  score <- as.numeric(predict(fit, newx = x, s = "lambda.min"))
+  list(
+    score = score,
+    selected = data.table(
+      Metal = metal,
+      Signature = type,
+      Feature = retained,
+      Coefficient = coefficients[retained, 1],
+      Lambda = fit$lambda.min
+    )
+  )
+}
+
+signature_results <- list()
+score_data <- data.table(id = data$id, Cholelithiasis = data$Cholelithiasis)
+
+for (metal in c("Li", "Zr")) {
+  microbiome_fit <- fit_signature(metal, "microbiome")
+  metabolite_fit <- fit_signature(metal, "metabolite")
+  combined_features <- c(prepare_features(metal, "microbiome"), prepare_features(metal, "metabolite"))
+  combined_matrix <- cbind(species_matrix[, intersect(combined_features, species_vars), drop = FALSE], metabolite_matrix[, intersect(combined_features, metabolite_vars), drop = FALSE])
+  combined_fit <- cv.glmnet(combined_matrix, data[[paste0("ln_", metal)]], family = "gaussian", alpha = 1, nfolds = 10)
+  combined_coefficients <- as.matrix(coef(combined_fit, s = "lambda.min"))
+  retained <- setdiff(rownames(combined_coefficients)[combined_coefficients[, 1] != 0], "(Intercept)")
+  score_data[[paste0(metal, "_microbiome_score")]] <- microbiome_fit$score
+  score_data[[paste0(metal, "_metabolite_score")]] <- metabolite_fit$score
+  score_data[[paste0(metal, "_combined_score")]] <- as.numeric(predict(combined_fit, newx = combined_matrix, s = "lambda.min"))
+  signature_results[[paste0(metal, "_microbiome")]] <- microbiome_fit$selected
+  signature_results[[paste0(metal, "_metabolite")]] <- metabolite_fit$selected
+  signature_results[[paste0(metal, "_combined")]] <- data.table(
+    Metal = metal,
+    Signature = "combined",
+    Feature = retained,
+    Coefficient = combined_coefficients[retained, 1],
+    Lambda = combined_fit$lambda.min
+  )
+}
+
+signature_coefficients <- rbindlist(signature_results, fill = TRUE)
+fwrite(signature_coefficients, "results/multiomics_signature_coefficients.csv")
+fwrite(score_data, "results/multiomics_signature_scores.csv")
+
+association_results <- rbindlist(lapply(setdiff(names(score_data), c("id", "Cholelithiasis")), function(variable) {
+  model_data <- data.frame(
+    outcome = data$Cholelithiasis,
+    score = as.numeric(scale(score_data[[variable]])),
+    age = data$age,
+    gender = factor(data$gender),
+    BMI = data$BMI,
+    smoking = factor(data$smoking),
+    drinking = factor(data$drinking)
+  )
+  fit <- glm(outcome ~ score + age + gender + BMI + smoking + drinking, family = binomial, data = model_data)
+  coefficient <- summary(fit)$coefficients["score", ]
+  data.table(
+    Signature = variable,
+    OR = exp(coefficient["Estimate"]),
+    CI_low = exp(coefficient["Estimate"] - 1.96 * coefficient["Std. Error"]),
+    CI_high = exp(coefficient["Estimate"] + 1.96 * coefficient["Std. Error"]),
+    P_value = coefficient["Pr(>|z|)"]
+  )
+}))
+fwrite(association_results, "results/multiomics_signature_associations.csv")
+
+serial_path <- function(exposure, mediator1, mediator2, bootstrap_iterations = 200) {
+  analysis_data <- data.frame(
+    X = data[[exposure]],
+    M1 = species_matrix[, mediator1],
+    M2 = metabolite_matrix[, mediator2],
+    Y = data$Cholelithiasis,
+    age = data$age,
+    gender = factor(data$gender),
+    BMI = data$BMI
+  )
+  estimate <- function(d) {
+    model1 <- lm(M1 ~ X + age + gender + BMI, data = d)
+    model2 <- lm(M2 ~ X + M1 + age + gender + BMI, data = d)
+    outcome <- glm(Y ~ X + M1 + M2 + age + gender + BMI, family = binomial, data = d)
+    c(
+      a1 = coef(model1)["X"],
+      a2 = coef(model2)["X"],
+      d21 = coef(model2)["M1"],
+      b1 = coef(outcome)["M1"],
+      b2 = coef(outcome)["M2"],
+      c_prime = coef(outcome)["X"],
+      serial_indirect = coef(model1)["X"] * coef(model2)["M1"] * coef(outcome)["M2"]
+    )
+  }
+  observed <- estimate(analysis_data)
+  bootstrap <- replicate(bootstrap_iterations, estimate(analysis_data[sample.int(nrow(analysis_data), replace = TRUE), ]))
+  intervals <- apply(bootstrap, 1, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+  data.table(
+    Exposure = exposure,
+    Microbe = mediator1,
+    Metabolite = mediator2,
+    Path = names(observed),
+    Estimate = as.numeric(observed),
+    CI_low = intervals[1, ],
+    CI_high = intervals[2, ]
+  )
+}
+
+pathways <- rbindlist(list(
+  serial_path("ln_Li", "sp_Phascolarctobacterium", "met_3_nitrotyrosine"),
+  serial_path("ln_Li", "sp_Faecalimonas", "met_5_hydroxytryptophan"),
+  serial_path("ln_Zr", "sp_Anaerostipes", "met_Tryptophan"),
+  serial_path("ln_Zr", "sp_Anaerostipes", "met_Normetanephrine")
+))
+fwrite(pathways, "results/exploratory_serial_pathways.csv")
+
+association_plot <- ggplot(association_results, aes(OR, reorder(Signature, OR))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high), height = 0.2) +
+  geom_point(size = 2.5, color = "#0D97A3") +
+  scale_x_log10() +
+  labs(x = "Odds ratio per SD increase", y = NULL) +
+  theme_classic(base_size = 11)
+ggsave("results/Figure_Multiomics_Signature_Associations.pdf", association_plot, width = 8, height = 5)
