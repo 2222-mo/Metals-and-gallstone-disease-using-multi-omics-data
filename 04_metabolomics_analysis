@@ -1,0 +1,135 @@
+library(data.table)
+library(ropls)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+
+dir.create("results", showWarnings = FALSE)
+
+data <- fread("data/simulated_multiomics_data.csv")
+metabolite_vars <- grep("^met_", names(data), value = TRUE)
+missing_fraction <- sapply(data[, ..metabolite_vars], function(x) mean(is.na(x) | x <= 0))
+metabolite_vars <- metabolite_vars[missing_fraction <= 0.30]
+
+for (variable in metabolite_vars) {
+  values <- data[[variable]]
+  missing <- is.na(values) | values <= 0
+  values[missing] <- min(values[!missing]) / sqrt(2)
+  set(data, j = variable, value = values)
+}
+
+metabolite_matrix <- as.matrix(data[, ..metabolite_vars])
+metabolite_scaled <- scale(metabolite_matrix)
+group <- factor(data$Cholelithiasis, levels = c(0, 1), labels = c("Non-Gallstone", "Gallstone"))
+
+pca <- prcomp(metabolite_scaled, center = FALSE, scale. = FALSE)
+pca_variance <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], Group = group)
+
+plsda <- opls(
+  x = metabolite_scaled,
+  y = group,
+  predI = 3,
+  orthoI = 0,
+  crossvalI = 7,
+  permI = 20,
+  fig.pdfC = "none",
+  info.txtC = "none"
+)
+pls_scores <- getScoreMN(plsda)
+pls_data <- data.frame(Component1 = pls_scores[, 1], Component2 = pls_scores[, 2], Group = group)
+vip <- getVipVn(plsda)
+
+colors <- c("Non-Gallstone" = "#D19A3B", "Gallstone" = "#0D97A3")
+p1 <- ggplot(pca_data, aes(PC1, PC2, color = Group)) +
+  stat_ellipse(aes(fill = Group), geom = "polygon", alpha = 0.12, show.legend = FALSE) +
+  geom_point(alpha = 0.75) +
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values = colors) +
+  labs(x = sprintf("PC1 (%.1f%%)", pca_variance[1]), y = sprintf("PC2 (%.1f%%)", pca_variance[2]), title = "PCA") +
+  theme_classic(base_size = 11)
+p2 <- ggplot(pls_data, aes(Component1, Component2, color = Group)) +
+  stat_ellipse(aes(fill = Group), geom = "polygon", alpha = 0.12, show.legend = FALSE) +
+  geom_point(alpha = 0.75) +
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values = colors) +
+  labs(title = "PLS-DA") +
+  theme_classic(base_size = 11)
+combined <- p1 + p2 + plot_layout(guides = "collect")
+ggsave("results/Figure_Metabolite_PCA_PLSDA_Gallstone.pdf", combined, width = 10, height = 5)
+write.csv(pca_data, "results/metabolite_PCA_Gallstone.csv", row.names = FALSE)
+write.csv(pls_data, "results/metabolite_PLSDA_Gallstone.csv", row.names = FALSE)
+
+metabolite_results <- rbindlist(lapply(seq_along(metabolite_vars), function(j) {
+  case_values <- metabolite_matrix[group == "Gallstone", j]
+  control_values <- metabolite_matrix[group == "Non-Gallstone", j]
+  model_data <- data.frame(
+    value = metabolite_scaled[, j],
+    Group = group,
+    age = data$age,
+    gender = factor(data$gender),
+    BMI = data$BMI
+  )
+  fit <- lm(value ~ Group + age + gender + BMI, data = model_data)
+  coefficient <- summary(fit)$coefficients["GroupGallstone", ]
+  data.table(
+    Metabolite = metabolite_vars[j],
+    Mean_GS = mean(case_values),
+    Mean_NonGS = mean(control_values),
+    FC = mean(case_values) / mean(control_values),
+    log2FC = log2(mean(case_values) / mean(control_values)),
+    T_test_Pvalue = t.test(case_values, control_values)$p.value,
+    LM_Beta = coefficient["Estimate"],
+    LM_SE = coefficient["Std. Error"],
+    LM_Pvalue = coefficient["Pr(>|t|)"],
+    VIP_Score = vip[j]
+  )
+}))
+metabolite_results[, P_FDR_T := p.adjust(T_test_Pvalue, method = "BH")]
+metabolite_results[, P_FDR_LM := p.adjust(LM_Pvalue, method = "BH")]
+metabolite_results[, Direction := fifelse(
+  P_FDR_LM < 0.10 & FC > 1.5,
+  "Up",
+  fifelse(P_FDR_LM < 0.10 & FC < 0.67, "Down", "NS")
+)]
+setorder(metabolite_results, P_FDR_LM)
+fwrite(metabolite_results, "results/metabolite_Gallstone_complete_results.csv")
+fwrite(metabolite_results[Direction != "NS"], "results/metabolite_Gallstone_significant.csv")
+
+volcano_data <- copy(metabolite_results)
+volcano_data[, neg_log10_p := -log10(T_test_Pvalue)]
+volcano_data[, Volcano_group := fifelse(
+  T_test_Pvalue < 0.05 & FC > 1.5,
+  "Up",
+  fifelse(T_test_Pvalue < 0.05 & FC < 0.67, "Down", "NS")
+)]
+labels <- head(volcano_data[Volcano_group != "NS"][order(T_test_Pvalue)], 12)
+volcano_plot <- ggplot(volcano_data, aes(log2FC, neg_log10_p, color = Volcano_group)) +
+  geom_point(alpha = 0.75) +
+  geom_text_repel(data = labels, aes(label = Metabolite), size = 3, max.overlaps = 15) +
+  geom_vline(xintercept = log2(c(0.67, 1.5)), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  scale_color_manual(values = c("Down" = "#D19A3B", "NS" = "grey70", "Up" = "#0D97A3")) +
+  labs(x = "log2 fold change", y = "-log10 P-value") +
+  theme_classic(base_size = 11)
+ggsave("results/Figure_Volcano_Metabolite_Gallstone.pdf", volcano_plot, width = 8, height = 7)
+
+target_metals <- c("Li", "Fe", "Mn", "Ni", "Sr", "Zr", "W")
+metal_metabolite <- rbindlist(lapply(target_metals, function(metal) {
+  exposure <- data[[paste0("ln_", metal)]]
+  results <- rbindlist(lapply(seq_along(metabolite_vars), function(j) {
+    fit <- lm(metabolite_scaled[, j] ~ exposure + data$age + factor(data$gender) + data$BMI)
+    coefficient <- summary(fit)$coefficients["exposure", ]
+    data.table(
+      Metabolite = metabolite_vars[j],
+      Metal = metal,
+      Beta = coefficient["Estimate"],
+      SE = coefficient["Std. Error"],
+      P_value = coefficient["Pr(>|t|)"]
+    )
+  }))
+  results[, P_FDR := p.adjust(P_value, method = "BH")]
+  results
+}))
+fwrite(metal_metabolite, "results/metabolite_metals_results.csv")
+fwrite(data, "results/metabolomics_imputed_data.csv")
