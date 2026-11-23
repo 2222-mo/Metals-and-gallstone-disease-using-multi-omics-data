@@ -1,0 +1,63 @@
+library(data.table)
+library(glmnet)
+
+set.seed(20261123)
+dir.create("results", showWarnings = FALSE)
+
+data <- fread("data/simulated_multiomics_data.csv")
+metal_vars <- grep("^ln_", names(data), value = TRUE)
+species_vars <- grep("^sp_", names(data), value = TRUE)
+metabolite_vars <- grep("^met_", names(data), value = TRUE)
+
+for (variable in metabolite_vars) {
+  values <- data[[variable]]
+  values[is.na(values)] <- median(values, na.rm = TRUE)
+  set(data, j = variable, value = values)
+}
+
+clr_row <- function(x) {
+  positive <- x[x > 0]
+  pseudocount <- if (length(positive)) min(positive) / 2 else 1e-10
+  adjusted <- x + pseudocount
+  log(adjusted) - mean(log(adjusted))
+}
+
+species_matrix <- t(apply(as.matrix(data[, ..species_vars]), 1, clr_row))
+colnames(species_matrix) <- species_vars
+data[, (species_vars) := as.data.table(species_matrix)]
+data[, (metabolite_vars) := lapply(.SD, function(x) as.numeric(scale(x))), .SDcols = metabolite_vars]
+
+case_index <- which(data$Cholelithiasis == 1)
+control_index <- which(data$Cholelithiasis == 0)
+train_index <- sort(c(
+  sample(case_index, floor(length(case_index) * 0.70)),
+  sample(control_index, floor(length(control_index) * 0.70))
+))
+test_index <- setdiff(seq_len(nrow(data)), train_index)
+
+select_features <- function(features, model_name) {
+  x_train <- as.matrix(data[train_index, ..features])
+  y_train <- data$Cholelithiasis[train_index]
+  fit <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1, nfolds = 10, type.measure = "auc")
+  coefficients <- as.matrix(coef(fit, s = "lambda.min"))
+  retained <- setdiff(rownames(coefficients)[coefficients[, 1] != 0], "(Intercept)")
+  if (!length(retained)) {
+    correlations <- apply(x_train, 2, function(x) abs(cor(x, y_train, use = "complete.obs")))
+    retained <- names(which.max(correlations))
+  }
+  coefficient_table <- data.table(
+    Model = model_name,
+    Feature = retained,
+    Coefficient = coefficients[retained, 1],
+    Lambda = fit$lambda.min
+  )
+  fwrite(coefficient_table, paste0("results/", model_name, "_features.csv"))
+  fwrite(data[train_index, c("id", "Cholelithiasis", retained), with = FALSE], paste0("results/", model_name, "_train.csv"))
+  fwrite(data[test_index, c("id", "Cholelithiasis", retained), with = FALSE], paste0("results/", model_name, "_test.csv"))
+  coefficient_table
+}
+
+model1 <- select_features(c(metal_vars, species_vars), "Gallstone_Model1_metal_microbiome")
+model2 <- select_features(c(metal_vars, metabolite_vars), "Gallstone_Model2_metal_metabolite")
+model3 <- select_features(c(metal_vars, species_vars, metabolite_vars), "Gallstone_Model3_metal_combined")
+fwrite(rbindlist(list(model1, model2, model3)), "results/lasso_selected_all_gallstone.csv")
