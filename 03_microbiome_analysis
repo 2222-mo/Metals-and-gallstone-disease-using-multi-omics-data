@@ -1,0 +1,157 @@
+library(data.table)
+library(vegan)
+library(ggplot2)
+library(ggrepel)
+
+dir.create("results", showWarnings = FALSE)
+
+data <- fread("data/simulated_multiomics_data.csv")
+species_vars <- grep("^sp_", names(data), value = TRUE)
+species <- as.matrix(data[, ..species_vars])
+group <- factor(data$Cholelithiasis, levels = c(0, 1), labels = c("Non-Gallstone", "Gallstone"))
+counts <- round(species * 100000)
+
+chao1 <- apply(counts, 1, function(x) {
+  observed <- sum(x > 0)
+  singletons <- sum(x == 1)
+  doubletons <- sum(x == 2)
+  if (doubletons > 0) observed + singletons^2 / (2 * doubletons) else observed + singletons * (singletons - 1) / 2
+})
+
+alpha <- data.table(
+  id = data$id,
+  Group = group,
+  Shannon = diversity(counts, index = "shannon"),
+  Simpson = diversity(counts, index = "simpson"),
+  Richness = rowSums(counts > 0),
+  Chao1 = chao1
+)
+alpha_tests <- rbindlist(lapply(c("Shannon", "Simpson", "Richness", "Chao1"), function(metric) {
+  test <- wilcox.test(alpha[[metric]] ~ alpha$Group, exact = FALSE)
+  data.table(Metric = metric, W = unname(test$statistic), P_value = test$p.value)
+}))
+fwrite(alpha, "results/microbiome_alpha_diversity.csv")
+fwrite(alpha_tests, "results/microbiome_alpha_tests.csv")
+
+alpha_long <- melt(alpha, id.vars = c("id", "Group"), variable.name = "Metric", value.name = "Value")
+alpha_plot <- ggplot(alpha_long, aes(Group, Value, fill = Group)) +
+  geom_violin(alpha = 0.55, trim = TRUE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white") +
+  facet_wrap(~Metric, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("Non-Gallstone" = "#D19A3B", "Gallstone" = "#0D97A3")) +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "none")
+ggsave("results/Figure_Alpha_Diversity_Gallstone.pdf", alpha_plot, width = 8, height = 7)
+
+clr_row <- function(x) {
+  positive <- x[x > 0]
+  pseudocount <- if (length(positive)) min(positive) / 2 else 1e-10
+  adjusted <- x + pseudocount
+  log(adjusted) - mean(log(adjusted))
+}
+
+species_clr <- t(apply(species, 1, clr_row))
+colnames(species_clr) <- species_vars
+distance <- dist(species_clr)
+ordination <- cmdscale(distance, eig = TRUE, k = 2)
+positive_eigenvalues <- ordination$eig[ordination$eig > 0]
+variance <- 100 * ordination$eig[1:2] / sum(positive_eigenvalues)
+ordination_data <- data.table(
+  id = data$id,
+  PCo1 = ordination$points[, 1],
+  PCo2 = ordination$points[, 2],
+  Group = group
+)
+group_info <- data.frame(Group = group)
+permanova <- adonis2(distance ~ Group, data = group_info, permutations = 999)
+
+pcoa_plot <- ggplot(ordination_data, aes(PCo1, PCo2, color = Group)) +
+  stat_ellipse(aes(fill = Group), geom = "polygon", alpha = 0.12, show.legend = FALSE) +
+  geom_point(alpha = 0.75) +
+  scale_color_manual(values = c("Non-Gallstone" = "#D19A3B", "Gallstone" = "#0D97A3")) +
+  scale_fill_manual(values = c("Non-Gallstone" = "#D19A3B", "Gallstone" = "#0D97A3")) +
+  labs(
+    x = sprintf("PCo1 (%.1f%%)", variance[1]),
+    y = sprintf("PCo2 (%.1f%%)", variance[2]),
+    subtitle = sprintf("PERMANOVA R² = %.3f, P = %.3f", permanova$R2[1], permanova$`Pr(>F)`[1])
+  ) +
+  theme_classic(base_size = 11)
+ggsave("results/Figure_PCoA_Gallstone.pdf", pcoa_plot, width = 7, height = 6)
+fwrite(ordination_data, "results/microbiome_pcoa_coordinates.csv")
+
+pca <- prcomp(species_clr, center = TRUE, scale. = TRUE)
+pca_variance <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+pca_data <- data.table(id = data$id, PC1 = pca$x[, 1], PC2 = pca$x[, 2], Group = group)
+pca_plot <- ggplot(pca_data, aes(PC1, PC2, color = Group)) +
+  stat_ellipse(aes(fill = Group), geom = "polygon", alpha = 0.12, show.legend = FALSE) +
+  geom_point(alpha = 0.75) +
+  scale_color_manual(values = c("Non-Gallstone" = "#D19A3B", "Gallstone" = "#0D97A3")) +
+  scale_fill_manual(values = c("Non-Gallstone" = "#D19A3B", "Gallstone" = "#0D97A3")) +
+  labs(x = sprintf("PC1 (%.1f%%)", pca_variance[1]), y = sprintf("PC2 (%.1f%%)", pca_variance[2])) +
+  theme_classic(base_size = 11)
+ggsave("results/Figure_PCA_Gallstone.pdf", pca_plot, width = 7, height = 6)
+fwrite(pca_data, "results/microbiome_pca_coordinates.csv")
+
+microbiome_results <- rbindlist(lapply(seq_along(species_vars), function(j) {
+  model_data <- data.frame(
+    abundance = species_clr[, j],
+    raw = species[, j],
+    Gallstone = group,
+    age = data$age,
+    gender = factor(data$gender),
+    BMI = data$BMI
+  )
+  fit <- lm(abundance ~ Gallstone + age + gender + BMI, data = model_data)
+  coefficient <- summary(fit)$coefficients["GallstoneGallstone", ]
+  mean_case <- mean(model_data$raw[model_data$Gallstone == "Gallstone"])
+  mean_control <- mean(model_data$raw[model_data$Gallstone == "Non-Gallstone"])
+  data.table(
+    Species = species_vars[j],
+    Beta = coefficient["Estimate"],
+    SE = coefficient["Std. Error"],
+    P_value = coefficient["Pr(>|t|)"],
+    Raw_FC = mean_case / mean_control,
+    Log2_FC = log2(mean_case / mean_control)
+  )
+}))
+microbiome_results[, P_FDR := p.adjust(P_value, method = "BH")]
+setorder(microbiome_results, P_FDR)
+fwrite(microbiome_results, "results/microbiome_species_Gallstone_CLR_FC_results.csv")
+
+target_metals <- c("Li", "Fe", "Mn", "Ni", "Sr", "Zr", "W")
+metal_microbiome <- rbindlist(lapply(target_metals, function(metal) {
+  exposure <- data[[paste0("ln_", metal)]]
+  results <- rbindlist(lapply(seq_along(species_vars), function(j) {
+    fit <- lm(species_clr[, j] ~ exposure + data$age + factor(data$gender) + data$BMI)
+    coefficient <- summary(fit)$coefficients["exposure", ]
+    data.table(
+      Species = species_vars[j],
+      Metal = metal,
+      Beta = coefficient["Estimate"],
+      SE = coefficient["Std. Error"],
+      P_value = coefficient["Pr(>|t|)"]
+    )
+  }))
+  results[, P_FDR := p.adjust(P_value, method = "BH")]
+  results
+}))
+fwrite(metal_microbiome, "results/microbiome_species_metals_CLR_results.csv")
+
+volcano_data <- copy(microbiome_results)
+volcano_data[, Direction := fifelse(
+  P_value < 0.05 & Raw_FC > 1.5,
+  "Up",
+  fifelse(P_value < 0.05 & Raw_FC < 0.67, "Down", "Not significant")
+)]
+volcano_data[, neg_log10_p := -log10(P_value)]
+labels <- head(volcano_data[Direction != "Not significant"][order(P_value)], 10)
+volcano_plot <- ggplot(volcano_data, aes(Log2_FC, neg_log10_p, color = Direction)) +
+  geom_point(alpha = 0.75) +
+  geom_text_repel(data = labels, aes(label = Species), size = 3, max.overlaps = 15) +
+  geom_vline(xintercept = log2(c(0.67, 1.5)), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  scale_color_manual(values = c("Down" = "#D19A3B", "Not significant" = "grey70", "Up" = "#0D97A3")) +
+  labs(x = "log2 fold change", y = "-log10 P-value") +
+  theme_classic(base_size = 11)
+ggsave("results/Figure_Volcano_Microbiome_Gallstone.pdf", volcano_plot, width = 8, height = 7)
