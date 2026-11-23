@@ -1,0 +1,105 @@
+library(data.table)
+library(tableone)
+library(gWQS)
+library(Hmisc)
+
+dir.create("results", showWarnings = FALSE)
+
+data <- fread("data/simulated_multiomics_data.csv")
+metal_names <- c(
+  "Li", "Be", "B", "Na", "Mg", "Al", "P", "Ca", "Ti", "V", "Cr",
+  "Fe", "Mn", "Ni", "Co", "Cu", "Zn", "Ga", "Ge", "Se", "Sr", "Zr",
+  "Nb", "Mo", "Ag", "Cd", "In", "Sn", "Sb", "Te", "Ba", "Hf", "W",
+  "Pb", "Bi"
+)
+ln_metals <- paste0("ln_", metal_names)
+factor_vars <- c("gender", "edu_merge", "smoke_imp", "drink_imp", "hyp_imp_new")
+data[, (factor_vars) := lapply(.SD, factor), .SDcols = factor_vars]
+data[, Gallstone := factor(Cholelithiasis, levels = c(0, 1), labels = c("Non-Gallstone", "Gallstone"))]
+
+baseline_vars <- c(
+  "age", "gender", "edu_merge", "smoke_imp", "drink_imp", "BMI",
+  "sleep_duration_imp", "total_met_week"
+)
+baseline_table <- CreateTableOne(
+  vars = baseline_vars,
+  strata = "Gallstone",
+  data = data,
+  factorVars = c("gender", "edu_merge", "smoke_imp", "drink_imp"),
+  test = TRUE
+)
+baseline_output <- print(
+  baseline_table,
+  showAllLevels = TRUE,
+  quote = FALSE,
+  noSpaces = TRUE,
+  printToggle = FALSE
+)
+write.csv(baseline_output, "results/baseline_table.csv")
+
+covariates <- c(
+  "age", "gender", "edu_merge", "smoke_imp", "drink_imp", "BMI",
+  "sleep_duration_imp", "total_met_week"
+)
+
+tertile_results <- rbindlist(lapply(ln_metals, function(metal) {
+  tertile <- cut(
+    data[[metal]],
+    breaks = quantile(data[[metal]], c(0, 1 / 3, 2 / 3, 1)),
+    labels = c("T1", "T2", "T3"),
+    include.lowest = TRUE
+  )
+  model_data <- copy(data)
+  model_data[, tertile := tertile]
+  fit <- glm(reformulate(c("tertile", covariates), "Cholelithiasis"), data = model_data, family = binomial())
+  coefficients <- summary(fit)$coefficients
+  rbindlist(lapply(c("T2", "T3"), function(level) {
+    row_name <- paste0("tertile", level)
+    beta <- coefficients[row_name, "Estimate"]
+    se <- coefficients[row_name, "Std. Error"]
+    data.table(
+      Metal = sub("ln_", "", metal),
+      Level = level,
+      OR = exp(beta),
+      CI_lower = exp(beta - 1.96 * se),
+      CI_upper = exp(beta + 1.96 * se),
+      P_value = coefficients[row_name, "Pr(>|z|)"]
+    )
+  }))
+}))
+tertile_results[, P_FDR := p.adjust(P_value, method = "BH")]
+fwrite(tertile_results, "results/metal_tertile_logistic.csv")
+
+wqs_data <- as.data.frame(data)
+wqs_model <- gwqs(
+  reformulate(c("wqs", covariates), "Cholelithiasis"),
+  mix_name = ln_metals,
+  data = wqs_data,
+  q = 4,
+  validation = 0.6,
+  b = 200,
+  b_pos = TRUE,
+  b_constr = FALSE,
+  family = "binomial",
+  seed = 123
+)
+wqs_coefficients <- summary(wqs_model)$coefficients
+wqs_row <- wqs_coefficients[grep("wqs", rownames(wqs_coefficients)), ]
+wqs_beta <- wqs_row["Estimate"]
+wqs_se <- wqs_row["Std. Error"]
+wqs_result <- data.table(
+  OR = exp(wqs_beta),
+  CI_lower = exp(wqs_beta - 1.96 * wqs_se),
+  CI_upper = exp(wqs_beta + 1.96 * wqs_se),
+  P_value = wqs_row["Pr(>|z|)"]
+)
+wqs_weights <- as.data.table(wqs_model$final_weights)
+wqs_weights[, Metal := sub("ln_", "", mix_name)]
+setorder(wqs_weights, -mean_weight)
+fwrite(wqs_result, "results/WQS_association.csv")
+fwrite(wqs_weights[, .(Metal, mean_weight)], "results/WQS_weights.csv")
+
+correlation <- rcorr(as.matrix(data[, ..ln_metals]), type = "spearman")
+write.csv(correlation$r, "results/metal_spearman_r.csv")
+write.csv(correlation$P, "results/metal_spearman_p.csv")
+fwrite(data, "results/analysis_data.csv")
