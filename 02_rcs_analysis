@@ -1,0 +1,60 @@
+library(data.table)
+library(rms)
+library(ggplot2)
+
+dir.create("results", showWarnings = FALSE)
+
+data <- fread("data/simulated_multiomics_data.csv")
+data[, gender := factor(gender)]
+data[, edu_merge := factor(edu_merge)]
+data[, smoke_imp := factor(smoke_imp)]
+data[, drink_imp := factor(drink_imp)]
+
+metals <- c("Li", "Fe", "Mn", "Ni", "Sr", "Zr", "W")
+covariates <- c(
+  "age", "gender", "edu_merge", "smoke_imp", "drink_imp", "BMI",
+  "sleep_duration_imp", "total_met_week"
+)
+
+dd <- datadist(data)
+options(datadist = "dd")
+
+predictions <- rbindlist(lapply(metals, function(metal) {
+  model_data <- copy(data)
+  model_data[, exposure := get(paste0("ln_", metal))]
+  fit <- lrm(
+    reformulate(c("rcs(exposure, 3)", covariates), "Cholelithiasis"),
+    data = model_data
+  )
+  prediction <- as.data.frame(Predict(fit, exposure, fun = exp, ref.zero = TRUE))
+  model_anova <- anova(fit)
+  prediction$Metal <- metal
+  prediction$P_overall <- model_anova[1, "P"]
+  prediction$P_nonlinear <- model_anova[2, "P"]
+  prediction
+}), fill = TRUE)
+
+labels <- unique(predictions[, .(Metal, P_overall, P_nonlinear)])
+labels[, label := sprintf(
+  "P-overall = %.3f\nP-nonlinear = %.3f",
+  P_overall,
+  P_nonlinear
+)]
+positions <- predictions[, .(
+  exposure = min(exposure),
+  yhat = max(upper)
+), by = Metal]
+labels <- merge(labels, positions, by = "Metal")
+
+plot <- ggplot(predictions, aes(exposure, yhat)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#4C78A8", alpha = 0.20) +
+  geom_line(color = "#2F5D8A", linewidth = 0.9) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_text(data = labels, aes(label = label), hjust = 0, vjust = 1, size = 3) +
+  facet_wrap(~Metal, scales = "free_x", nrow = 1) +
+  labs(x = "Log-transformed urinary metal concentration", y = "OR (95% CI)") +
+  theme_classic(base_size = 11)
+
+ggsave("results/RCS_7metals_Gallstone.pdf", plot, width = 18, height = 4)
+ggsave("results/RCS_7metals_Gallstone.png", plot, width = 18, height = 4, dpi = 300)
+fwrite(predictions, "results/RCS_predictions.csv")
